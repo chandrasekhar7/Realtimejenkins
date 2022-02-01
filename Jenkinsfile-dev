@@ -1,0 +1,152 @@
+def COMMIT_MSGS = ''
+def LIST = ''
+pipeline {
+	agent any
+	environment {
+		GIT_BRANCH    			= 'Dev-deploy-os'
+		BITBUCKET_CREDS			= 'svc_jenkinsaff'
+		GIT_REPO_URL			= 'git@bitbucket.org:americanfirstfinance/envelope-center.git'
+		OCP_TOKEN				= credentials('sa-dev-kwiksign-envelope-builder')
+		NEXUS_CREDS				= credentials('nexus-creds')
+		QUAY_CREDS				= credentials('kwiksign-roboaccount')
+		WORKSPACE				= pwd()
+		IMAGE_NAME				= 'envelope-center'
+		TAG						= 'dev1.8'
+	}
+	options {
+		buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '10'))
+		skipDefaultCheckout()
+		disableConcurrentBuilds() 
+	}
+	stages {
+		stage("Cleanup Workspace") {
+			steps {
+				cleanWs()
+				//clean up tmp directory
+				dir("${env.WORKSPACE}@tmp") {
+					deleteDir()
+				}
+				// clean up script directory 
+				dir("${env.WORKSPACE}@script") {
+					deleteDir()
+				}
+				dir("${env.WORKSPACE}@script@tmp") {
+					deleteDir()
+				}
+				step([$class: 'WsCleanup'])
+			}
+		}
+		stage("Checkout") {
+			steps {
+				git branch: "${env.GIT_BRANCH}",
+                  credentialsId: "${env.BITBUCKET_CREDS}",
+                  url: "${env.GIT_REPO_URL}"
+			}
+		}
+		stage("Gradle: Build") {
+			steps {
+				//send slack notification about build start
+				slackSend (color: '#FFFF00', message: "STARTED: Job: '${env.JOB_NAME} [${env.BUILD_NUMBER}]', (${env.BUILD_URL})")
+				sh '''
+				pwd
+				ls -ltr
+				chmod +x gradlew
+				sudo ./gradlew clean -g /opt/jenkinshome1/.gradle
+				sudo ./gradlew build -x test -g /opt/jenkinshome1/.gradle 
+				sudo ./gradlew addExtension --extensions="openshift" -g /opt/jenkinshome1/.gradle
+				sudo ./gradlew quarkusBuild -Dquarkus.profile=dev -Dquarkus.package.type=uber-jar -g /opt/jenkinshome1/.gradle
+				'''
+			}
+		}
+		stage('Sonarqube') {
+           environment {
+                scannerHome = tool 'SonarQubeScanner'
+           }
+           steps {
+              withSonarQubeEnv('sonarqube') {
+              sh "${scannerHome}/bin/sonar-scanner"
+			  }
+           }
+		} 
+		stage("Build & Push Image") {
+			steps {
+				sh '''
+				sudo podman login -u ${QUAY_CREDS_USR} -p ${QUAY_CREDS_PSW}  quay.io
+				sudo podman build -t ${IMAGE_NAME}:${TAG} . 
+				sudo podman images
+				echo "${IMAGE_NAME}:${TAG}" > sysdig_secure_images
+				sudo podman tag ${IMAGE_NAME}:${TAG} nexus.americanfirstfinance.com/aff/${IMAGE_NAME}:${TAG}
+				sudo podman login nexus.americanfirstfinance.com -u ${NEXUS_CREDS_USR} -p ${NEXUS_CREDS_PSW}
+				sudo podman push nexus.americanfirstfinance.com/aff/${IMAGE_NAME}:${TAG} --tls-verify=false && echo "Push to internal repo" 
+				sudo podman logout nexus.americanfirstfinance.com 
+				'''
+			}
+		}
+		stage("Sysdig Scanning") {
+			steps {
+				// Scanning image with Sysdig and pushing it to Quay
+				script {
+					sh '''
+					sudo podman run -it quay.io/sysdig/secure-inline-scan:2 nexus.americanfirstfinance.com/aff/${IMAGE_NAME}:${TAG} --sysdig-token c0511008-bc66-49f3-b91c-2deea2d0f9de --sysdig-url https://us2.app.sysdig.com --sysdig-skip-tls
+					echo "Tagging  for external repo push"
+					sudo podman tag nexus.americanfirstfinance.com/aff/${IMAGE_NAME}:${TAG} quay.io/americanfirstfinance/${IMAGE_NAME}:${TAG}
+					echo "Pushing Image to external Quay Registry"
+					sudo podman login -u ${QUAY_CREDS_USR} -p ${QUAY_CREDS_PSW}  quay.io
+					sudo podman push quay.io/americanfirstfinance/${IMAGE_NAME}:${TAG}
+					sudo podman logout quay.io
+					'''
+				}
+			}
+		} 
+		stage("Deploy to OC") {
+			steps {
+				sh'''
+				oc login --token=$OCP_TOKEN_PSW --server=https://api.dev.cloud.americanfirstfinance.com:6443 --insecure-skip-tls-verify=true
+				oc delete -f $WORKSPACE/deployments/env/dev/dev-deployment.yaml
+				oc apply -f $WORKSPACE/deployments/env/dev/dev-deployment.yaml
+				oc get all 
+				oc logout --token=$OCP_TOKEN_PSW --server=https://api.dev.cloud.americanfirstfinance.com:6443 --insecure-skip-tls-verify=true
+				'''
+
+			}
+		} 
+		stage("Get Change logs") {
+			steps {
+				script {
+					//script to get GIT_COMMIT Change logs
+					LIST = getChangeString(COMMIT_MSGS)
+					LIST.toString()
+				}
+			}
+        }
+	}
+	post {  
+        always {
+			script {
+				slackSend (color: '#00FF00', message: "*${currentBuild.currentResult}:* Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' \n ChangeLogs: ${LIST} \n More info at: (${env.BUILD_URL})")
+			}
+        }
+    } 
+}
+
+@NonCPS
+def getChangeString(COMMIT_MSGS) {
+ 	MAX_MSG_LEN = 100
+ 	def changeString = ""
+ 	echo "Gathering SCM changes"
+ 	def changeLogSets = currentBuild.changeSets
+ 	for (int i = 0; i < changeLogSets.size(); i++) {
+ 		def entries = changeLogSets[i].items
+ 		for (int j = 0; j < entries.length; j++) {
+ 			def entry = entries[j]
+			//echo "Commit by ${entry.author} at ${new Date(entry.timestamp)}: ${entry.msg}; \n"
+			COMMIT_MSGS += "Commit by ${entry.author} at ${new Date(entry.timestamp)}: ${entry.msg}; \n"
+			//echo "COMMIT_MSGS: ${COMMIT_MSGS}"
+		}
+ 	}
+ 	if (!changeString) {
+ 		changeString = " - No new changes"
+ 	}
+ 	//return [changeString,COMMIT_MSGS];
+	return [COMMIT_MSGS];
+}
